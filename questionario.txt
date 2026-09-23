@@ -1,0 +1,277 @@
+QUESTIONARIO - App To-Do (Kotlin Multiplatform)
+
+Respostas baseadas no codigo-fonte gerado durante o exercicio.
+
+
+================================================================
+1. ESTRUTURA DO PROJETO
+================================================================
+
+O projeto e um modulo KMP unico chamado :composeApp com tres
+source sets:
+
+  composeApp/src/
+  |- commonMain/                          (codigo compartilhado Android + Desktop)
+  |   |- sqldelight/com/aecio/todo/db/TodoDatabase.sq   (schema + queries SQL)
+  |   '- kotlin/com/aecio/todo/
+  |       |- model/TodoModel.kt           (extensoes de dominio: isCompleted, dueAt, StatusFilter)
+  |       |- db/Drivers.kt                (expect fun createDatabaseDriver())
+  |       |- data/                        (AppContainer.kt, TaskRepository.kt, CategoryRepository.kt)
+  |       |- notifications/NotificationScheduler.kt      (expect object)
+  |       '- ui/                          (App.kt, Navigation.kt, TodoViewModel.kt, format/, theme/)
+  |           '- screens/                 (TaskListScreen.kt, TaskEditorScreen.kt, CategoryScreen.kt)
+  |- androidMain/                         (codigo especifico Android)
+  |   |- AndroidManifest.xml
+  |   '- kotlin/com/aecio/todo/           (MainActivity.kt, db/Drivers.android.kt,
+  |       |                               notifications/NotificationScheduler.android.kt,
+  |       |                               notifications/NotificationReceiver.kt)
+  |       '- res/drawable/ic_notification.xml
+  '- desktopMain/                         (codigo especifico Desktop)
+      '- kotlin/com/aecio/todo/           (main.kt, db/Drivers.desktop.kt,
+                                          notifications/NotificationScheduler.desktop.kt,
+                                          ui/ProvidePlatformViewModelOwner.desktop.kt)
+
+Onde cada parte esta:
+
+- UI/telas: commonMain/.../ui/screens/ - TaskListScreen.kt (lista + filtros),
+  TaskEditorScreen.kt (criar/editar/excluir), CategoryScreen.kt (gerenciar categorias).
+
+- Modelos de dados: arquivos gerados pelo SQLDelight Task.kt/Category.kt
+  (em build/generated/sqldelight/...) + extensoes de dominio em model/TodoModel.kt.
+
+- Codigo SQLite: TodoDatabase.sq (schema + queries) e os drivers em db/Drivers.*.
+
+- Navegacao: ui/Navigation.kt (modelo Screen) + ui/App.kt (AppNavHost, back-stack manual).
+
+- Notificacoes: common/.../notifications/NotificationScheduler.kt (declaracao expect)
+  com implementacoes actual para Android e Desktop.
+
+
+================================================================
+2. ARQUITETURA E ESTADO
+================================================================
+
+Padrao: MVVM com ViewModel + StateFlow (estado) no commonMain e repository
+como abstracao de dados:
+
+- TodoViewModel (ui/TodoViewModel.kt) expoe StateFlows: tasks, categories,
+  statusFilter, categoryFilter e filteredTasks (um combine dos tres anteriores,
+  .stateIn(viewModelScope, ...)).
+
+- As telas usam collectAsState() para ler o estado
+  (ex.: TaskListScreen.kt:68 - "val tasks by vm.filteredTasks.collectAsState()").
+
+- A base da "atualizacao automatica da UI" e o SQLDelight com queries reativas:
+  TaskRepository.observeAll() retorna Flow<List<Task>> via
+  queries.selectAllTasks().asFlow().mapToList(Dispatchers.Default).
+  No init{} do ViewModel, esse Flow alimenta _tasks.value.
+
+Como a UI se atualiza apos cada operacao:
+
+  1. A tela chama um metodo do ViewModel (ex.: vm.createTask(draft)), que
+     executa a gravacao via repositorio -> INSERT/UPDATE direto no SQLite.
+  2. O driver do SQLDelight dispara notifyQueries(...) para a tabela alterada ->
+     o Query de observeAll e notificado -> o Flow reemite a nova lista.
+  3. _tasks.value e atualizado -> filteredTasks recomputa -> collectAsState()
+     na TaskListScreen provoca recomposicao -> a tarefa aparece automaticamente.
+
+Ou seja: nao ha "refresh manual" nem evento de volta explicito; a UI reage
+ao banco virando fluxo. Criacao, edicao e "marcar como concluida" (via
+vm.toggleTask) seguem exatamente esse ciclo. Classes/funcoes envolvidas:
+TodoViewModel.createTask/updateTask/toggleTask -> TaskRepository.insert/
+update/setCompleted -> queries geradas -> notificacao de listeners ->
+collectAsState.
+
+
+================================================================
+3. PERSISTENCIA SQLITE
+================================================================
+
+Abstracao: SQLDelight 2.3.2 - SQL em .sq compilado em chamadas tipadas.
+
+- Onde o banco e criado: db/Drivers.kt declara "expect fun createDatabaseDriver()".
+  * Android (db/Drivers.android.kt): AndroidSqliteDriver com
+    TodoDatabase.Schema, appContext e nome "todo.db" + PRAGMA foreign_keys = ON.
+  * Desktop (db/Drivers.desktop.kt): JdbcSqliteDriver em ~/.ddm-todo/todo.db
+    + TodoDatabase.Schema.createIfNotExists(driver) + mesmo PRAGMA.
+
+- Schema (TodoDatabase.sq): tabelas "category (id, name, color)" e
+  "task (id, title, description, completed, dueDateEpochMillis,
+  createdAtEpochMillis, categoryId, notificationId)" com
+  FOREIGN KEY(categoryId) REFERENCES category(id) ON DELETE SET NULL.
+  Datas gravadas como epoch millis (Long); completed como 0/1.
+
+- CRUD: nos repositorios data/TaskRepository.kt e data/CategoryRepository.kt,
+  que chamam as queries geradas em TodoDatabaseQueries:
+  * Create: insertTask / insertCategory;
+  * Read: selectAllTasks, selectTaskById / selectAllCategories, selectCategoryById
+    (via observeAll()/getById());
+  * Update: updateTask, setTaskCompleted, setTaskNotificationId, updateCategory
+    e updateTasksCategoryToNull (usado ao excluir categoria p/ desassociar tarefas);
+  * Delete: deleteTask / deleteCategory.
+
+
+================================================================
+4. RASTREANDO A CRIACAO DE UMA TAREFA
+================================================================
+
+Fluxo do clique em Salvar (TaskEditorScreen.kt, botao ~linhas 236-264):
+
+  1. Tela monta um TaskDraft (id, titulo, descricao, prazo, categoria,
+     concluida) e chama vm.createTask(draft) (ou updateTask quando taskId != null).
+
+  2. TodoViewModel.createTask (TodoViewModel.kt:97-112):
+     - validate() exige titulo nao vazio;
+     - now = Clock.System.now();
+     - id = taskRepository.insert(title, description, completed,
+       dueDateEpochMillis = draft.dueAt?.toEpochMilliseconds(),
+       createdAtEpochMillis = now, categoryId, notificationId = null).
+
+  3. TaskRepository.insert (TaskRepository.kt:17-36) executa
+     queries.insertTask(...) (INSERT no todo.db) e em seguida retorna o id
+     lido com queries.selectLastTaskId().executeAsOne() - pois o SQLDelight
+     2.3 nao expoe lastInsertRowId() (detalhe na secao 8).
+
+  4. Notificacao: com o novo id, createTask chama scheduleIfNeeded(id, draft)
+     (TodoViewModel.kt:158-164): se o prazo existir, for futuro e a tarefa
+     nao estiver concluida, chama NotificationScheduler.schedule(id, title, due)
+     e grava o id da notificacao retornado via taskRepository.setNotificationId.
+
+  5. Aparecer na lista: o INSERT dispara notifyQueries -> observeAll().asFlow()
+     reemite -> _tasks.value e atualizado no init{} -> filteredTasks recomputa
+     -> a TaskListScreen recomposa e mostra a tarefa.
+
+Componentes principais: TaskEditorScreen -> TodoViewModel.createTask/
+scheduleIfNeeded -> TaskRepository -> TodoDatabaseQueries.insertTask/
+selectLastTaskId -> NotificationScheduler.schedule.
+
+
+================================================================
+5. NAVEGACAO
+================================================================
+
+Navegacao manual com back-stack: ui/App.kt (AppNavHost) mantem
+"remember { mutableStateListOf<Screen>(Screen.TaskList) }" e renderiza
+when (current):
+
+- Lista -> Editor: TaskListScreen recebe
+  onOpenTask = { backStack.add(Screen.TaskEditor(it)) } (App.kt:39).
+  O clique na Card da tarefa chama onOpenTask(task.id).
+
+- Voltar: onBack = { backStack.removeAt(backStack.lastIndex) }.
+
+O que e passado entre telas: apenas o taskId: Long? (Navigation.kt,
+Screen.TaskEditor(taskId)). Para tarefa nova, null; para edicao, so o id.
+O objeto completo NAO viaja na navegacao: o editor le o estado compartilhado
+do ViewModel (vm.tasks.value.firstOrNull { it.id == id },
+TaskEditorScreen.kt:71) e resolve categoria via vm.categoryById(...).
+Ou seja: estado compartilhado (ViewModel) + id como chave, sem biblioteca
+de navegacao.
+
+
+================================================================
+6. NOTIFICACOES
+================================================================
+
+Declaradas como "expect object NotificationScheduler"
+(notifications/NotificationScheduler.kt) com currentPermission,
+requestPermission, schedule(taskId, title, dueAt): Long? e
+cancel(taskId, notificationId?).
+
+Android (NotificationScheduler.android.kt):
+- Cria o canal tasks_reminders (importancia HIGH) e checa/solicita
+  POST_NOTIFICATIONS (API 33+).
+- schedule monta um PendingIntent para NotificationReceiver (extras taskId e
+  title, requestCode = taskId) e agenda AlarmManager.setExactAndAllowWhileIdle
+  (com fallbacks inexatos quando alarme exato nao e permitido -
+  canScheduleExactAlarms()/SecurityException). Retorna taskId, que e gravado
+  em task.notificationId -> associacao notificacao <-> tarefa.
+- O NotificationReceiver recebe o broadcast e chama
+  NotificationScheduler.postNotification(taskId, title), que publica a
+  notificacao (NotificationCompat) com id = taskId.
+
+Trocar o prazo / editar (TodoViewModel.updateTask, TodoViewModel.kt:114-147):
+- calcula oldDue/oldNotif; se havia notificacao antiga e ela nao e mais
+  necessaria (oldDue != due || !willNotify) -> NotificationScheduler.cancel(id, oldNotif);
+- se ainda vai notificar e o prazo mudou (ou nao havia notificacao) ->
+  schedule novamente; o novo id e persistido no updateTask.
+
+Concluir a tarefa (toggleTask, TodoViewModel.kt:76-94): ao concluir, cancela
+a notificacao (se existir) e grava notificationId = null; ao desmarcar, se
+houver prazo futuro, re-agenda.
+
+Excluir (deleteTask, TodoViewModel.kt:149-156): cancela a notificacao e
+depois apaga a linha (taskRepository.delete).
+
+Desktop (NotificationScheduler.desktop.kt): Timer agendado para dueAt;
+exibe balao via SystemTray/TrayIcon (ou println como fallback) - sem modelo
+de permissao.
+
+
+================================================================
+7. DECISOES DO AGENTE NAO ESPECIFICADAS NO ENUNCIADO
+================================================================
+
+1. Evitar a reestruturacao para AGP 9 escolhendo uma matriz de versoes
+   estavel. A investigacao mostrou que a Compose Multiplatform 1.12 exige
+   AGP 9.1+ e compileSdk 37, e que o AGP 9 forcaria a divisao em "KMP
+   library + app Android". O agente optou por Gradle 8.14.3 + AGP 8.13.2 +
+   Kotlin 2.2.20 + Compose Multiplatform 1.10.3 + compileSdk 36 para manter
+   um unico modulo :composeApp, trocando "ultimas versoes" por estabilidade.
+   (Documentado no BUILD_LOG.md.)
+
+2. SQLDelight como camada de persistencia ja no commonMain, com padrao
+   "INSERT e depois SELECT o id": por usar o dialeto sqlite_3_18 (padrao)
+   e SQLite antigo no Android, lastInsertRowId() nao existe no codigo gerado
+   e RETURNING nao e suportado. Em vez de mudar o dialeto/estrutura, o agente
+   voltou ao INSERT simples e leu o id com
+   "SELECT id FROM task ORDER BY id DESC LIMIT 1"
+   (selectLastTaskId/selectLastCategoryId) - decisao de portabilidade
+   (funciona em qualquer SQLite, inclusive API 26).
+
+3. Navegacao manual por back-stack (sem biblioteca) com passagem apenas do
+   taskId, em vez de usar Navigation Compose - mais simples, sem dependencia
+   extra e funciona igual em Android e Desktop.
+
+4. Arquitetura MVVM + injecao manual via AppContainer/App.init
+   (service locator) e expect/actual para o driver do banco - sem Hilt/Koin,
+   mantendo o codigo compartilhado simples e multiplataforma.
+
+5. Target Desktop (JVM) como alvo extra alem do celular, para permitir
+   testar o app (incluindo notificacoes via Timer + bandeja) sem aparelho
+   Android, por cima do mesmo commonMain.
+
+
+================================================================
+8. ANALISE DO BUILD_LOG
+================================================================
+
+Um problema encontrado: a necessidade do id da tarefa logo apos o INSERT
+(para agendar a notificacao). A primeira tentativa usou
+"INSERT ... RETURNING id", mas o gerador falhou:
+
+  TodoDatabase.sq:20 ',' expected, got 'RETURNING'
+  - o dialeto sqlite_3_18 NAO aceita RETURNING.
+
+Como o agente tentou resolver:
+  1. RETURNING id (falhou na geracao);
+  2. ao analisar o motivo, concluiu que RETURNING tambem quebraria em runtime
+     em SQLite de Android < API 34, entao nem mesmo aumentaria o dialeto;
+  3. desmontou o RETURNING e criou as queries auxiliares
+     selectLastTaskId/selectLastCategoryId (... ORDER BY id DESC LIMIT 1),
+     chamadas logo apos o insert para obter o id.
+
+A solucao funcionou (o build passou apos essa correcao).
+
+O que o log ajudou a entender que so o codigo final nao mostra:
+- Por que as versoes atuais nao sao as "latest": o log registra os caminhos
+  rejeitados (Gradle 9.7.1/9.5 incompativeis com AGP 8.x, CMP 1.12 exigindo
+  AGP 9.1 + divisao em modulos) que levaram a matriz estavel. Precisar deduzir
+  isso do codigo final seria dificil.
+- Por que o id e buscado com selectLastTaskId: parece uma query "estranha"
+  se vista isolada; o log explica que e uma workaround para
+  lastInsertRowId()/RETURNING.
+- O esforco de "versao vs. runtime": decisoes como kotlinx-datetime 0.6.2
+  (em vez do artefato -compat, que quebrava os tipos Instant) e
+  PRAGMA foreign_keys = ON nos drivers (o parser do SQLDelight rejeita ON
+  no .sq) ficam registradas somente no log.

@@ -1,0 +1,70 @@
+CREATE TABLE category (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    name TEXT NOT NULL,
+    color INTEGER
+);
+
+CREATE TABLE task (
+    id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    completed INTEGER NOT NULL DEFAULT 0,
+    dueDateEpochMillis INTEGER,
+    createdAtEpochMillis INTEGER NOT NULL,
+    categoryId INTEGER,
+    notificationId INTEGER,
+    FOREIGN KEY(categoryId) REFERENCES category(id) ON DELETE SET NULL
+);
+
+insertCategory:
+INSERT INTO category(name, color) VALUES (?, ?);
+
+selectAllCategories:
+SELECT * FROM category ORDER BY name COLLATE NOCASE ASC;
+
+selectCategoryById:
+SELECT * FROM category WHERE id = ?;
+
+updateCategory:
+UPDATE category SET name = ?, color = ? WHERE id = ?;
+
+deleteCategory:
+DELETE FROM category WHERE id = ?;
+
+insertTask:
+INSERT INTO task(title, description, completed, dueDateEpochMillis, createdAtEpochMillis, categoryId, notificationId)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+selectTaskById:
+SELECT * FROM task WHERE id = ?;
+
+selectAllTasks:
+SELECT * FROM task ORDER BY createdAtEpochMillis DESC;
+
+updateTask:
+UPDATE task SET
+    title = ?,
+    description = ?,
+    completed = ?,
+    dueDateEpochMillis = ?,
+    categoryId = ?,
+    notificationId = ?
+WHERE id = ?;
+
+updateTasksCategoryToNull:
+UPDATE task SET categoryId = NULL WHERE categoryId = ?;
+
+setTaskCompleted:
+UPDATE task SET completed = ? WHERE id = ?;
+
+setTaskNotificationId:
+UPDATE task SET notificationId = ? WHERE id = ?;
+
+deleteTask:
+DELETE FROM task WHERE id = ?;
+
+selectLastTaskId:
+SELECT id FROM task ORDER BY id DESC LIMIT 1;
+
+selectLastCategoryId:
+SELECT id FROM category ORDER BY id DESC LIMIT 1;
